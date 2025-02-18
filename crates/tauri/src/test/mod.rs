@@ -64,7 +64,7 @@ use crate::{
 };
 use tauri_utils::{
   acl::resolved::Resolved,
-  assets::{AssetKey, CspHash},
+  assets::{AssetKey, AssetsIter, CspHash},
   config::{AppConfig, Config},
 };
 
@@ -82,8 +82,13 @@ impl<R: Runtime> Assets<R> for NoopAsset {
     None
   }
 
-  fn iter(&self) -> Box<dyn Iterator<Item = (&str, &[u8])> + '_> {
-    Box::new(self.assets.iter().map(|(k, b)| (k.as_str(), b.as_slice())))
+  fn iter(&self) -> Box<AssetsIter<'_>> {
+    Box::new(
+      self
+        .assets
+        .iter()
+        .map(|(k, b)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(b.as_slice()))),
+    )
   }
 
   fn csp_hashes(&self, html_path: &AssetKey) -> Box<dyn Iterator<Item = CspHash<'_>> + '_> {
@@ -105,6 +110,7 @@ pub fn mock_context<R: Runtime, A: Assets<R>>(assets: A) -> crate::Context<R> {
     config: Config {
       schema: None,
       product_name: Default::default(),
+      main_binary_name: Default::default(),
       version: Default::default(),
       identifier: Default::default(),
       app: AppConfig {

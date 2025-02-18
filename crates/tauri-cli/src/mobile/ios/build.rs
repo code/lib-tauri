@@ -30,6 +30,7 @@ use cargo_mobile2::{
   opts::{NoiseLevel, Profile},
   target::{call_for_targets_with_fallback, TargetInvalid, TargetTrait},
 };
+use rand::distributions::{Alphanumeric, DistString};
 
 use std::{
   env::{set_current_dir, var, var_os},
@@ -174,6 +175,11 @@ pub fn command(options: Options, noise_level: NoiseLevel) -> Result<()> {
   )?;
   inject_resources(&config, tauri_config.lock().unwrap().as_ref().unwrap())?;
 
+  let mut plist = plist::Dictionary::new();
+  let version = interface.app_settings().get_package_settings().version;
+  plist.insert("CFBundleShortVersionString".into(), version.clone().into());
+  plist.insert("CFBundleVersion".into(), version.into());
+
   let info_plist_path = config
     .project_dir()
     .join(config.scheme())
@@ -182,6 +188,7 @@ pub fn command(options: Options, noise_level: NoiseLevel) -> Result<()> {
     info_plist_path.clone().into(),
     tauri_path.join("Info.plist").into(),
     tauri_path.join("Info.ios.plist").into(),
+    plist::Value::Dictionary(plist).into(),
   ])?;
   merged_info_plist.to_file_xml(&info_plist_path)?;
 
@@ -234,7 +241,7 @@ pub fn command(options: Options, noise_level: NoiseLevel) -> Result<()> {
     options,
     build_options,
     tauri_config,
-    &config,
+    &mut config,
     &mut env,
     noise_level,
   )?;
@@ -252,7 +259,7 @@ fn run_build(
   options: Options,
   mut build_options: BuildOptions,
   tauri_config: ConfigHandle,
-  config: &AppleConfig,
+  config: &mut AppleConfig,
   env: &mut Env,
   noise_level: NoiseLevel,
 ) -> Result<OptionsHandle> {
@@ -265,12 +272,11 @@ fn run_build(
   crate::build::setup(&interface, &mut build_options, tauri_config.clone(), true)?;
 
   let app_settings = interface.app_settings();
-  let bin_path = app_settings.app_binary_path(&InterfaceOptions {
+  let out_dir = app_settings.out_dir(&InterfaceOptions {
     debug: build_options.debug,
     target: build_options.target.clone(),
     ..Default::default()
   })?;
-  let out_dir = bin_path.parent().unwrap();
   let _lock = flock::open_rw(out_dir.join("lock").with_extension("ios"), "iOS")?;
 
   let cli_options = CliOptions {
@@ -287,6 +293,10 @@ fn run_build(
     cli_options,
   )?;
 
+  if options.open {
+    return Ok(handle);
+  }
+
   let mut out_files = Vec::new();
 
   call_for_targets_with_fallback(
@@ -300,21 +310,21 @@ fn run_build(
       }
 
       let credentials = auth_credentials_from_env()?;
+      let skip_signing = credentials.is_some();
 
-      let mut build_config = BuildConfig::new()
-        .allow_provisioning_updates()
-        .skip_codesign();
+      let mut build_config = BuildConfig::new().allow_provisioning_updates();
       if let Some(credentials) = &credentials {
-        build_config = build_config.authentication_credentials(credentials.clone());
+        build_config = build_config
+          .authentication_credentials(credentials.clone())
+          .skip_codesign();
       }
 
-      target.build(
-        config,
-        env,
-        NoiseLevel::FranklyQuitePedantic,
-        profile,
-        build_config,
-      )?;
+      target.build(config, env, noise_level, profile, build_config)?;
+
+      let mut archive_config = ArchiveConfig::new();
+      if skip_signing {
+        archive_config = archive_config.skip_codesign();
+      }
 
       target.archive(
         config,
@@ -322,13 +332,8 @@ fn run_build(
         noise_level,
         profile,
         Some(app_version),
-        ArchiveConfig::new().skip_codesign(),
+        archive_config,
       )?;
-
-      let mut export_config = ExportConfig::new().allow_provisioning_updates();
-      if let Some(credentials) = credentials {
-        export_config = export_config.authentication_credentials(credentials);
-      }
 
       let out_dir = config.export_dir().join(target.arch);
 
@@ -347,6 +352,51 @@ fn run_build(
         fs::rename(&app_path, &path)?;
         out_files.push(path);
       } else {
+        // if we skipped code signing, we do not have the entitlements applied to our exported IPA
+        // we must force sign the app binary with a dummy certificate just to preserve the entitlements
+        // target.export() will sign it with an actual certificate for us
+        if skip_signing {
+          let password = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+          let certificate = tauri_macos_sign::certificate::generate_self_signed(
+            tauri_macos_sign::certificate::SelfSignedCertificateRequest {
+              algorithm: "rsa".to_string(),
+              profile: tauri_macos_sign::certificate::CertificateProfile::AppleDistribution,
+              team_id: "unset".to_string(),
+              person_name: "Tauri".to_string(),
+              country_name: "NL".to_string(),
+              validity_days: 365,
+              password: password.clone(),
+            },
+          )?;
+          let tmp_dir = tempfile::tempdir()?;
+          let cert_path = tmp_dir.path().join("cert.p12");
+          std::fs::write(&cert_path, certificate)?;
+          let self_signed_cert_keychain =
+            tauri_macos_sign::Keychain::with_certificate_file(&cert_path, &password.into())?;
+
+          let app_dir = config
+            .export_dir()
+            .join(format!("{}.xcarchive", config.scheme()))
+            .join("Products/Applications")
+            .join(format!("{}.app", config.app().stylized_name()));
+
+          self_signed_cert_keychain.sign(
+            &app_dir.join(config.app().stylized_name()),
+            Some(
+              &config
+                .project_dir()
+                .join(config.scheme())
+                .join(format!("{}.entitlements", config.scheme())),
+            ),
+            false,
+          )?;
+        }
+
+        let mut export_config = ExportConfig::new().allow_provisioning_updates();
+        if let Some(credentials) = &credentials {
+          export_config = export_config.authentication_credentials(credentials.clone());
+        }
+
         target.export(config, env, noise_level, export_config)?;
 
         if let Ok(ipa_path) = config.ipa_path() {

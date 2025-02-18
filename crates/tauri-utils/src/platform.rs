@@ -309,25 +309,22 @@ fn resource_dir_from<P: AsRef<std::path::Path>>(
 
   #[cfg(target_os = "linux")]
   {
-    res = if curr_dir.ends_with("/data/usr/bin") {
-      // running from the deb bundle dir
-      exe_dir
-        .join(format!("../lib/{}", package_info.crate_name))
-        .canonicalize()
-        .map_err(Into::into)
+    // (canonicalize checks for existence, so there's no need for an extra check)
+    res = if let Ok(bundle_dir) = exe_dir
+      .join(format!("../lib/{}", package_info.name))
+      .canonicalize()
+    {
+      Ok(bundle_dir)
     } else if let Some(appdir) = &env.appdir {
       let appdir: &std::path::Path = appdir.as_ref();
       Ok(PathBuf::from(format!(
         "{}/usr/lib/{}",
         appdir.display(),
-        package_info.crate_name
+        package_info.name
       )))
     } else {
       // running bundle
-      Ok(PathBuf::from(format!(
-        "/usr/lib/{}",
-        package_info.crate_name
-      )))
+      Ok(PathBuf::from(format!("/usr/lib/{}", package_info.name)))
     };
   }
 
@@ -399,6 +396,7 @@ mod tests {
     assert_eq!(resource_dir, path.parent().unwrap());
 
     let path = PathBuf::from("/path/to/target/unknown-profile/app");
+    #[allow(clippy::needless_borrows_for_generic_args)]
     let resource_dir = super::resource_dir_from(&path, &package_info, &env);
     #[cfg(target_os = "macos")]
     assert!(resource_dir.is_err());
